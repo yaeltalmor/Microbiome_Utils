@@ -3,6 +3,7 @@ print(torch.cuda.is_available())
 import torch.nn as nn
 import math
 import torch.nn.functional as F
+from enum import Enum
 
 class TransformerTestUtils:
     """Static utility functions for validating Transformer building blocks."""
@@ -75,13 +76,18 @@ class ValueEmbeddingNumeric(nn.Module):
             out = out * mask.unsqueeze(-1)
         return out
 
+class EventEmbAggregateMethod(Enum):
+    CONCAT = "concat"
+    SUM = "sum"
+
 class HybridEventEmbedding(nn.Module):
-    def __init__(self, num_event_tokens, num_value_tokens, d_model):
+    def __init__(self, num_event_tokens, num_value_tokens, d_model, event_emb_agg_method: EventEmbAggregateMethod = EventEmbAggregateMethod.SUM):
         super().__init__()
         # In PyTorch, you can set padding_idx in nn.Embedding so that the missing index always maps to a zero vector.
         self.event_emb = nn.Embedding(num_event_tokens, d_model, padding_idx=0)
         self.value_emb_cat = nn.Embedding(num_value_tokens, d_model, padding_idx=0)
         self.value_emb_num = ValueEmbeddingNumeric(d_model)
+        self.event_emb_agg_method = event_emb_agg_method
 
     def forward(self, event_idx, value_idx, numeric_value, value_type_mask=None):
         """
@@ -102,7 +108,10 @@ class HybridEventEmbedding(nn.Module):
 
         # Combine categorical and numeric embeddings
         e_v = e_v_cat + e_v_num  # sum where one operand is zero, by value type
-        e_i = e_f + e_v
+        if self.event_emb_agg_method == EventEmbAggregateMethod.CONCAT:
+            e_i = torch.cat([e_f, e_v], dim=-1)
+        elif self.event_emb_agg_method == EventEmbAggregateMethod.SUM:
+            e_i = e_f + e_v
         return e_i
 
 # ------------------ TEMPORAL POSITIONAL EMBEDDING LAYER ------------------
@@ -311,6 +320,15 @@ class ClassifierHead(nn.Module):
             return torch.sigmoid(logits)  # (B, 1) probabilities in [0,1]
         return logits  # raw logits for BCEWithLogitsLoss
 
+class TimeEmbeddingType(Enum):
+    REL_POS_ENC = "rel_pos_enc"
+    CVE = "cve"
+    TOKEN_EMB = "token_emb"
+
+class EventTimeEmbAggregateMethod(Enum):
+    CONCAT = "concat"
+    SUM = "sum"
+
 # ------------------ TEMPORAL TRANSFORMER CLASSIFIER ------------------
 class TemporalTransformerClassifier(nn.Module):
     """
@@ -327,14 +345,28 @@ class TemporalTransformerClassifier(nn.Module):
                  dropout: float = 0.1,
                  pooling: str = "max",          # "max" | "mean" | "attention"
                  cls_hidden: int = 64,          # MLP head hidden size
-                 metadata_dim: int = None): # if provided → enable metadata embedding
+                 metadata_dim: int = None,
+                 event_emb_agg_method: EventEmbAggregateMethod = EventEmbAggregateMethod.SUM,
+                 event_time_emb_agg_method: EventTimeEmbAggregateMethod = EventTimeEmbAggregateMethod.CONCAT,
+                 time_emb_type: TimeEmbeddingType = TimeEmbeddingType.REL_POS_ENC): # if provided → enable metadata embedding
         super().__init__()
 
-        self.hybrid_emb = HybridEventEmbedding(num_event_tokens, num_value_tokens, event_d_model)
-        self.time_pe = TimePositionalEncoding(temp_d_model)
+        self.hybrid_emb = HybridEventEmbedding(num_event_tokens, num_value_tokens, event_d_model, event_emb_agg_method)
+
+        if time_emb_type == TimeEmbeddingType.REL_POS_ENC:
+            self.time_emb = TimePositionalEncoding(temp_d_model)
+        elif time_emb_type == TimeEmbeddingType.CVE:
+            self.time_emb = ValueEmbeddingNumeric(temp_d_model)
+        elif time_emb_type == TimeEmbeddingType.TOKEN_EMB:
+            self.time_emb = nn.Embedding(500, event_d_model, padding_idx=0)
+
+        self.time_emb_type = time_emb_type
 
         # Combined model dimension after concat
-        self.d_model = event_d_model + temp_d_model
+        if event_time_emb_agg_method == EventTimeEmbAggregateMethod.CONCAT:
+            self.d_model = event_d_model + temp_d_model
+        elif event_time_emb_agg_method == EventTimeEmbAggregateMethod.SUM:
+            self.d_model = event_d_model
 
         self.layers = nn.ModuleList(
             [EncoderLayer(self.d_model, num_heads, d_ff, dropout) for _ in range(num_layers)]
@@ -408,10 +440,13 @@ class TemporalTransformerClassifier(nn.Module):
         e_fv = self.hybrid_emb(event_idx, value_idx, numeric_value, value_type_mask)  # (B, L, event_d_model)
 
         # (2) Temporal encodings
-        e_t = self.time_pe(t_values)                                                  # (B, L, temp_d_model)
+        e_t = self.time_emb(t_values)                                                  # (B, L, temp_d_model)
 
-        # (3) Concatenate
-        x = torch.cat([e_fv, e_t], dim=-1)                                            # (B, L, d_model)
+        # # (3) Concatenate
+        if self.event_time_emb_agg_method == EventTimeEmbAggregateMethod.CONCAT:
+            x = torch.cat([e_fv, e_t], dim=-1)                                            # (B, L, d_model)
+        elif self.event_time_emb_agg_method == EventTimeEmbAggregateMethod.SUM:
+            x = e_fv + e_t  # TODO: Option: sum instead of concat, to keep d_model smaller
 
         # (4) Transformer encoder
         for layer in self.layers:
@@ -430,102 +465,102 @@ class TemporalTransformerClassifier(nn.Module):
         out = self.classifier(pooled, return_probs=inference)                          # (B,1) logits or probs
         return out
 
-# ---------------EXAMPLE USAGE---------------
-model = TemporalTransformerClassifier(
-    num_event_tokens=4, num_value_tokens=3,
-    event_d_model=64, temp_d_model=32,
-    num_layers=1, num_heads=1, d_ff=256,
-    dropout=0.1, pooling="attention",  # or "max"/"mean"
-    cls_hidden=64, metadata_dim=None
-)
-
-# ==== Toy test ====
-
-# 1. Build vocab for events and categorical values
-event_vocab = {None: 0, "drug_A": 1, "drug_B": 2, "lab_test": 3}
-value_vocab = {None: 0, "aspirin": 1, "paracetamol": 2}  # categorical values only
-
-# 2. Fake batch of token indices
-event_idx = torch.tensor([
-    [1, 2, 3, 0],   # patient 1
-    [2, 3, 0, 0]    # patient 2
-], dtype=torch.long)
-
-value_idx = torch.tensor([
-    [1, 2, 0, 0],   # categorical values for patient 1
-    [1, 0, 0, 0]    # categorical values for patient 2
-], dtype=torch.long)
-
-# 3. Numeric values (aligned with events)
-numeric_value = torch.tensor([
-    [0.0, 0.0, 1.2, 0.0],
-    [0.0, 0.0, 0.0, 0.0]
-], dtype=torch.float32)
-
-# 4. Mask: 1 if numeric, 0 if categorical/missing
-value_type_mask = torch.tensor([
-    [0, 0, 1, 0],
-    [0, 1, 0, 0]
-], dtype=torch.float32)
-
-# 5. Temporal indices (months since diagnosis)
-t_values = torch.tensor([
-    [-8, 11, 26, 0],
-    [-1, 100, 0, 0]
-], dtype=torch.long)
-
-# 6. metadata encodings
-# 1-hot vector: [<main_diagnosis_Ulcerative_Colitis, gender_female, visit_child_department_Yes, smoking_No, smoking_missing>]
-metadata_idx = torch.tensor([
-    [0, 1, 1, 1, 0], # non-smoking crohns girl
-    [1, 0, 0, 1, 1]  # smoking colitis male adult
-], dtype=torch.float32)
-
-# 6. Padding mask (1 = keep, 0 = pad)
-src_mask = (event_idx != 0).bool()   # shape (B, L)
-
-# 7. Dummy binary labels (drug switch yes/no)
-labels = torch.tensor([1, 0], dtype=torch.float32)  # (B,)
-
-# --------------TRAINING LOOP EXAMPLE--------------
-# 7. Dummy binary labels (drug switch yes/no)
-labels = torch.tensor([1, 0], dtype=torch.float32)  # (B,)
-
-# optimizer = torch.optim.Adam(model.parameters(), lr=1e-4) # optimizer
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3) # optimizer for toy run - faster learning rate
-criterion = nn.BCEWithLogitsLoss() # loss function
-
-# ==== Training loop (toy test: 3 epochs) ====
-num_epochs = 100
-for epoch in range(num_epochs):
-    model.train() # put model in training mode (activates dropout etc.)
-    optimizer.zero_grad()  # reset gradients from last step
-
-    logits = model(event_idx, value_idx, numeric_value, value_type_mask, t_values, src_mask, metadata_idx, inference=False)
-
-    # --- Core asserts (shape + NaN/Inf) ---
-    assert logits.shape == (event_idx.size(0), 1), f"Expected (B,1), got {logits.shape}"
-    assert torch.isfinite(logits).all(), "Logits contain NaN or Inf"
-
-    # compute loss
-    loss = criterion(logits.squeeze(-1), labels)
-
-    # backpropagate gradients
-    loss.backward()
-
-    # quick gradient sanity check
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            assert param.grad is not None, f"No gradient for {name}"
-            assert torch.isfinite(param.grad).all(), f"Bad gradient in {name}"
-    # update weights
-    optimizer.step()
-
-    print(f"Epoch {epoch+1}: loss = {loss.item():.4f}")
-
-# ==== Inference (probabilities) ====
-model.eval()
-with torch.no_grad():
-    probs = model(event_idx, value_idx, numeric_value, value_type_mask, t_values, src_mask, metadata_idx, inference=True)
-
-    print("Predicted probabilities:", probs)
+# # ---------------EXAMPLE USAGE---------------
+# model = TemporalTransformerClassifier(
+#     num_event_tokens=4, num_value_tokens=3,
+#     event_d_model=64, temp_d_model=32,
+#     num_layers=1, num_heads=1, d_ff=256,
+#     dropout=0.1, pooling="attention",  # or "max"/"mean"
+#     cls_hidden=64, metadata_dim=None
+# )
+#
+# # ==== Toy test ====
+#
+# # 1. Build vocab for events and categorical values
+# event_vocab = {None: 0, "drug_A": 1, "drug_B": 2, "lab_test": 3}
+# value_vocab = {None: 0, "aspirin": 1, "paracetamol": 2}  # categorical values only
+#
+# # 2. Fake batch of token indices
+# event_idx = torch.tensor([
+#     [1, 2, 3, 0],   # patient 1
+#     [2, 3, 0, 0]    # patient 2
+# ], dtype=torch.long)
+#
+# value_idx = torch.tensor([
+#     [1, 2, 0, 0],   # categorical values for patient 1
+#     [1, 0, 0, 0]    # categorical values for patient 2
+# ], dtype=torch.long)
+#
+# # 3. Numeric values (aligned with events)
+# numeric_value = torch.tensor([
+#     [0.0, 0.0, 1.2, 0.0],
+#     [0.0, 0.0, 0.0, 0.0]
+# ], dtype=torch.float32)
+#
+# # 4. Mask: 1 if numeric, 0 if categorical/missing
+# value_type_mask = torch.tensor([
+#     [0, 0, 1, 0],
+#     [0, 1, 0, 0]
+# ], dtype=torch.float32)
+#
+# # 5. Temporal indices (months since diagnosis)
+# t_values = torch.tensor([
+#     [-8, 11, 26, 0],
+#     [-1, 100, 0, 0]
+# ], dtype=torch.long)
+#
+# # 6. metadata encodings
+# # 1-hot vector: [<main_diagnosis_Ulcerative_Colitis, gender_female, visit_child_department_Yes, smoking_No, smoking_missing>]
+# metadata_idx = torch.tensor([
+#     [0, 1, 1, 1, 0], # non-smoking crohns girl
+#     [1, 0, 0, 1, 1]  # smoking colitis male adult
+# ], dtype=torch.float32)
+#
+# # 6. Padding mask (1 = keep, 0 = pad)
+# src_mask = (event_idx != 0).bool()   # shape (B, L)
+#
+# # 7. Dummy binary labels (drug switch yes/no)
+# labels = torch.tensor([1, 0], dtype=torch.float32)  # (B,)
+#
+# # --------------TRAINING LOOP EXAMPLE--------------
+# # 7. Dummy binary labels (drug switch yes/no)
+# labels = torch.tensor([1, 0], dtype=torch.float32)  # (B,)
+#
+# # optimizer = torch.optim.Adam(model.parameters(), lr=1e-4) # optimizer
+# optimizer = torch.optim.Adam(model.parameters(), lr=1e-3) # optimizer for toy run - faster learning rate
+# criterion = nn.BCEWithLogitsLoss() # loss function
+#
+# # ==== Training loop (toy test: 3 epochs) ====
+# num_epochs = 100
+# for epoch in range(num_epochs):
+#     model.train() # put model in training mode (activates dropout etc.)
+#     optimizer.zero_grad()  # reset gradients from last step
+#
+#     logits = model(event_idx, value_idx, numeric_value, value_type_mask, t_values, src_mask, metadata_idx, inference=False)
+#
+#     # --- Core asserts (shape + NaN/Inf) ---
+#     assert logits.shape == (event_idx.size(0), 1), f"Expected (B,1), got {logits.shape}"
+#     assert torch.isfinite(logits).all(), "Logits contain NaN or Inf"
+#
+#     # compute loss
+#     loss = criterion(logits.squeeze(-1), labels)
+#
+#     # backpropagate gradients
+#     loss.backward()
+#
+#     # quick gradient sanity check
+#     for name, param in model.named_parameters():
+#         if param.requires_grad:
+#             assert param.grad is not None, f"No gradient for {name}"
+#             assert torch.isfinite(param.grad).all(), f"Bad gradient in {name}"
+#     # update weights
+#     optimizer.step()
+#
+#     print(f"Epoch {epoch+1}: loss = {loss.item():.4f}")
+#
+# # ==== Inference (probabilities) ====
+# model.eval()
+# with torch.no_grad():
+#     probs = model(event_idx, value_idx, numeric_value, value_type_mask, t_values, src_mask, metadata_idx, inference=True)
+#
+#     print("Predicted probabilities:", probs)

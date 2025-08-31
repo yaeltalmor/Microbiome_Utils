@@ -404,13 +404,57 @@ def mask_cat_based_data_for_catboost(cat_based_df:pd.DataFrame, train_window_len
         else:
             print(f"date column: {date_col} not mapped in mappers")
 
-    # transform to avg. per year. -100 if missing.
-    # masked_cat_based_df = transform_exams_to_avg_per_year(masked_cat_based_df, train_window_len)
-    # Take the latest categorical event of each value series of temporal-hot encodings
-    # masked_cat_based_df = create_latest_event_value_encoding(masked_cat_based_df)
+    # Fill categorical NaN with 'missing' label for CatBoost
     cat_features = [col for i, col in enumerate(masked_cat_based_df.columns) if masked_cat_based_df[col].dtype == "object"]
     for col in cat_features:
         masked_cat_based_df[col] = masked_cat_based_df[col].astype(object).where(masked_cat_based_df[col].notna(), 'missing').astype(str)
+
+    # Filter patients with trajectory_length >= threshold
+    masked_cat_based_df = masked_cat_based_df[masked_cat_based_df["end_of_data"] + 1 >= trajectory_length_threshold]
+    # masked_cat_based_df = masked_cat_based_df.set_index('patient_id')
+
+    # Filter patients with zero medical intervention
+    masked_cat_based_df = filter_zero_medical_intervention_patients(masked_cat_based_df)
+
+    return masked_cat_based_df
+
+
+def mask_cat_based_data_for_transformer(cat_based_df: pd.DataFrame, train_window_len: int,
+                                     trajectory_length_threshold: int) -> pd.DataFrame:
+    '''
+    This function masks the events according to the train_window_len requested,
+    and tranformes the data to fit to RF (temporal-hot encodings and exams avg per year etc).
+    :param train_window_len: mask all patients events succeeding train_window_len
+    :param trajectory_length_threshold: Filter patients with trajectory_length >= trajectory_length_threshold
+    :return: df_events_agg: the events counters for the relevant patients history
+    '''
+    # Mask features by train_window_len
+    date_cols = [col for col in cat_based_df.columns if 'date' in col]
+    masked_cat_based_df = cat_based_df.copy()
+    # Mask Dates and change format if needed
+    for col in date_cols:
+        masked_cat_based_df[col] = masking_rule(masked_cat_based_df, col, train_window_len,
+                                                intervals_from_diagnosis=True)
+
+    # Recalculate duration based on next drug start (if exists), otherwise based on last available month
+    mask_drug_durations(train_window_len, masked_cat_based_df)
+
+    # Mask events
+    for i, date_col in enumerate(date_cols):
+
+        if date_col in GENERAL_DATE_EVENT_MAPPING:
+            # leave date column, no event column to mask.
+            if date_col == 'diagnosis_date':
+                # No need of these columns since it's aligned for all patients and set to 0
+                masked_cat_based_df = masked_cat_based_df.drop(columns=[date_col])
+
+        elif date_col in PER_PATIENT_DATE_EVENT_MAPPING:
+            # Mask event values columns based on corresponding date columns
+            event_col = PER_PATIENT_DATE_EVENT_MAPPING[date_col][1]
+            masked_cat_based_df[event_col] = masked_cat_based_df[event_col].where(masked_cat_based_df[date_col].notna(),
+                                                                                  np.nan)
+        else:
+            print(f"date column: {date_col} not mapped in mappers")
 
     # Filter patients with trajectory_length >= threshold
     masked_cat_based_df = masked_cat_based_df[masked_cat_based_df["end_of_data"] + 1 >= trajectory_length_threshold]
