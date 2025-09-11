@@ -50,18 +50,23 @@ class TransformerTestUtils:
 # ------------------------- TRANSFORMER BUILDING BLOCKS ------------------
 # ------------------ EVENT EMBEDDING LAYER ------------------
 
-class ValueEmbeddingNumeric(nn.Module):
+class ContinuousValueEmbedding(nn.Module):
     """
     STraTS Continuous Value Embedding (CVE) technique -
-    FFN for numeric values initial embeddings: 1 input neuron → sqrt(d) hidden → d output, tanh activation.
+    FFN for numeric values initial embeddings: 1 input neuron → cve_hidden_size → d output, tanh activation.
+    if cve_hidden_size is 0, use a single linear layer 1 → d_model without hidden layer or activation.
     """
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, cve_hidden_size: int = None):
         super().__init__()
-        hidden_size = int(math.sqrt(d_model))
-        self.ffn = nn.Sequential(
-            nn.Linear(1, hidden_size),
-            nn.Tanh(),
-            nn.Linear(hidden_size, d_model)
+        if cve_hidden_size>0:
+            self.ffn = nn.Sequential(
+                nn.Linear(1, cve_hidden_size),
+                nn.Tanh(),
+                nn.Linear(cve_hidden_size, d_model)
+            )
+        if cve_hidden_size is 0:
+            self.ffn = nn.Sequential(
+            nn.Linear(1, d_model)
         )
 
     def forward(self, numeric_values, mask=None):
@@ -81,12 +86,13 @@ class EventEmbAggregateMethod(Enum):
     SUM = "sum"
 
 class HybridEventEmbedding(nn.Module):
-    def __init__(self, num_event_tokens, num_value_tokens, d_model, event_emb_agg_method: EventEmbAggregateMethod = EventEmbAggregateMethod.SUM):
+    def __init__(self, num_event_tokens, num_value_tokens, d_model, cve_hidden_size,
+                 event_emb_agg_method: EventEmbAggregateMethod = EventEmbAggregateMethod.SUM):
         super().__init__()
         # In PyTorch, you can set padding_idx in nn.Embedding so that the missing index always maps to a zero vector.
         self.event_emb = nn.Embedding(num_event_tokens, d_model, padding_idx=0)
         self.value_emb_cat = nn.Embedding(num_value_tokens, d_model, padding_idx=0)
-        self.value_emb_num = ValueEmbeddingNumeric(d_model)
+        self.value_emb_num = ContinuousValueEmbedding(d_model, cve_hidden_size)
         self.event_emb_agg_method = event_emb_agg_method
 
     def forward(self, event_idx, value_idx, numeric_value, value_type_mask=None):
@@ -115,33 +121,71 @@ class HybridEventEmbedding(nn.Module):
         return e_i
 
 # ------------------ TEMPORAL POSITIONAL EMBEDDING LAYER ------------------
+class TimeEmbeddingType(Enum):
+    REL_POS_ENC = "rel_pos_enc"
+    CVE = "cve"
+    TIME2VEC = "time2vec"  # Kazemi et al. 2019
+
 class TimePositionalEncoding(nn.Module):
     """
     Positional Encoding that uses real time values (t_values in months) instead of just indices,
     and concatenates to the original event embeddings.
     """
-    def __init__(self, temp_d_model: int):
+    def __init__(self, temp_d_model: int, emb_type: TimeEmbeddingType = TimeEmbeddingType.REL_POS_ENC,
+                 add_nonperiodic: bool = True):
         super().__init__()
-        self.temp_d_model = temp_d_model # The concatenated temporal encodings dimenstion
+        self.temp_d_model = temp_d_model # The concatenated temporal encodings dimension
+        self.emb_type = emb_type
+        self.add_nonperiodic = add_nonperiodic
+
+        if emb_type == TimeEmbeddingType.REL_POS_ENC and self.add_nonperiodic:
+            assert self.temp_d_model > 2, "temp_d_model must be >2 to add non-periodic encodings."
+            self.temp_d_model -= 2
+
+        if emb_type == TimeEmbeddingType.TIME2VEC:
+            # 1 non-periodic + (d-1) periodic
+            self.omega = nn.Parameter(torch.randn(temp_d_model - 1))  # frequencies
+            self.phi = nn.Parameter(torch.randn(temp_d_model - 1))  # phases
+            self.omega_lin = nn.Parameter(torch.randn(1))  # linear freq
+            self.phi_lin = nn.Parameter(torch.randn(1))  # linear phase
 
     def forward(self, t_values):
         """
         t_values: (batch_size, seq_len) - actual months since diagnosis
         """
-        # Expand t_values to shape (batch, seq_len, 1)
-        position = t_values.unsqueeze(-1)  # now (batch, seq_len, 1)
-        # Compute div_term for sinusoidal encoding
-        div_term = torch.exp(
-            torch.arange(0, self.temp_d_model, 2, dtype=torch.float, device=t_values.device)
-            * -(math.log(10000.0) / self.temp_d_model)
-        )
+        if self.emb_type == TimeEmbeddingType.REL_POS_ENC:
+            # Expand t_values to shape (batch, seq_len, 1)
+            position = t_values.unsqueeze(-1)  # now (batch, seq_len, 1)
+            # Compute div_term for sinusoidal encoding
+            div_term = torch.exp(
+                torch.arange(0, self.temp_d_model, 2, dtype=torch.float, device=t_values.device)
+                * -(math.log(10000.0) / self.temp_d_model)
+            )
 
-        # Initialize positional encoding tensor - add temp_d_model dimension
-        pe = torch.zeros(t_values.size(0), t_values.size(1), self.temp_d_model, device=t_values.device)
-        pe[:, :, 0::2] = torch.sin(position * div_term)
-        pe[:, :, 1::2] = torch.cos(position * div_term)
+            # Initialize positional encoding tensor - add temp_d_model dimension
+            pe = torch.zeros(t_values.size(0), t_values.size(1), self.temp_d_model, device=t_values.device)
+            pe[:, :, 0::2] = torch.sin(position * div_term)
+            pe[:, :, 1::2] = torch.cos(position * div_term)
 
-        return pe  # shape: (batch, seq_len, d_model)
+            if self.add_nonperiodic:
+                t_norm = (t_values / (t_values.max() + 1e-6)).unsqueeze(-1)  # normalize 0–1
+                t2_norm = (t_norm ** 2)
+                pe = torch.cat([pe, t_norm, t2_norm], dim=-1)  # (B, L, d_model+2)
+                assert pe.shape[-1] == self.temp_d_model + 2, "Temporal PE shape mismatch after adding non-periodic."
+
+            return pe  # shape: (batch, seq_len, d_model)
+
+        elif self.emb_type == TimeEmbeddingType.TIME2VEC:
+            # ----- Time2Vec -----
+            t = t_values.unsqueeze(-1)  # (B,L,1)
+            # Non-periodic (linear)
+            lin = self.omega_lin * t + self.phi_lin  # (B,L,1)
+            # Periodic (learnable sinusoids)
+            per = torch.sin(t * self.omega + self.phi)  # (B,L,d-1)
+            assert per.shape[-1] == self.temp_d_model - 1, "Time2Vec periodic shape mismatch."
+
+            return torch.cat([lin, per], dim=-1)  # (B,L,d)
+
 
 # ------------------ METADATA EMBEDDING LAYER ------------------
 
@@ -320,11 +364,6 @@ class ClassifierHead(nn.Module):
             return torch.sigmoid(logits)  # (B, 1) probabilities in [0,1]
         return logits  # raw logits for BCEWithLogitsLoss
 
-class TimeEmbeddingType(Enum):
-    REL_POS_ENC = "rel_pos_enc"
-    CVE = "cve"
-    TOKEN_EMB = "token_emb"
-
 class EventTimeEmbAggregateMethod(Enum):
     CONCAT = "concat"
     SUM = "sum"
@@ -345,28 +384,36 @@ class TemporalTransformerClassifier(nn.Module):
                  dropout: float = 0.1,
                  pooling: str = "max",          # "max" | "mean" | "attention"
                  cls_hidden: int = 64,          # MLP head hidden size
+                 cve_num_val_hidden: int = 4,      # CVE hidden layer size
                  metadata_dim: int = None,
+                 md_token: bool = False,          # if True → prepend metadata embedding as [MD] token to sequence
                  event_emb_agg_method: EventEmbAggregateMethod = EventEmbAggregateMethod.SUM,
                  event_time_emb_agg_method: EventTimeEmbAggregateMethod = EventTimeEmbAggregateMethod.CONCAT,
                  time_emb_type: TimeEmbeddingType = TimeEmbeddingType.REL_POS_ENC): # if provided → enable metadata embedding
         super().__init__()
 
-        self.hybrid_emb = HybridEventEmbedding(num_event_tokens, num_value_tokens, event_d_model, event_emb_agg_method)
-
-        if time_emb_type == TimeEmbeddingType.REL_POS_ENC:
-            self.time_emb = TimePositionalEncoding(temp_d_model)
-        elif time_emb_type == TimeEmbeddingType.CVE:
-            self.time_emb = ValueEmbeddingNumeric(temp_d_model)
-        elif time_emb_type == TimeEmbeddingType.TOKEN_EMB:
-            self.time_emb = nn.Embedding(500, event_d_model, padding_idx=0)
-
-        self.time_emb_type = time_emb_type
-
         # Combined model dimension after concat
         if event_time_emb_agg_method == EventTimeEmbAggregateMethod.CONCAT:
             self.d_model = event_d_model + temp_d_model
         elif event_time_emb_agg_method == EventTimeEmbAggregateMethod.SUM:
-            self.d_model = event_d_model
+            self.d_model = event_d_model if event_emb_agg_method == EventEmbAggregateMethod.SUM \
+                else 2 * event_d_model
+        self.event_time_emb_agg_method = event_time_emb_agg_method
+
+        self.hybrid_emb = HybridEventEmbedding(num_event_tokens, num_value_tokens, event_d_model,
+                                               cve_num_val_hidden, event_emb_agg_method)
+
+        if time_emb_type == TimeEmbeddingType.REL_POS_ENC:
+            self.time_emb = TimePositionalEncoding(temp_d_model, emb_type=TimeEmbeddingType.REL_POS_ENC,
+                                                   add_nonperiodic=True)
+        elif time_emb_type == TimeEmbeddingType.CVE:
+            self.time_emb = ContinuousValueEmbedding(temp_d_model, int(math.sqrt(self.d_model)))
+        elif time_emb_type == TimeEmbeddingType.TIME2VEC:
+            self.time_emb = TimePositionalEncoding(temp_d_model, emb_type=TimeEmbeddingType.TIME2VEC)
+
+        self.time_emb_type = time_emb_type
+
+
 
         self.layers = nn.ModuleList(
             [EncoderLayer(self.d_model, num_heads, d_ff, dropout) for _ in range(num_layers)]
@@ -382,6 +429,7 @@ class TemporalTransformerClassifier(nn.Module):
         if metadata_dim is not None:
             # TODO: if used in concat instead of sum extend classifier input dim
             self.md_emb = MetadataEmbedding(metadata_dim, self.d_model)
+            self.md_token = md_token
         else:
             self.md_emb = None
 
@@ -422,7 +470,7 @@ class TemporalTransformerClassifier(nn.Module):
                 t_values: torch.Tensor,
                 src_mask: torch.Tensor,
                 metadata_idx: torch.Tensor = None,
-                inference: bool = False):
+                inference: bool = False,):
         """
         Inputs:
           - event_idx, value_idx: (B, L)
@@ -442,11 +490,22 @@ class TemporalTransformerClassifier(nn.Module):
         # (2) Temporal encodings
         e_t = self.time_emb(t_values)                                                  # (B, L, temp_d_model)
 
-        # # (3) Concatenate
+        # (3) Concatenate
         if self.event_time_emb_agg_method == EventTimeEmbAggregateMethod.CONCAT:
             x = torch.cat([e_fv, e_t], dim=-1)                                            # (B, L, d_model)
         elif self.event_time_emb_agg_method == EventTimeEmbAggregateMethod.SUM:
-            x = e_fv + e_t  # TODO: Option: sum instead of concat, to keep d_model smaller
+            x = e_fv + e_t
+
+        # (3b) Optionally prepend metadata as [MD] token
+        if (self.md_emb is not None) and self.md_token and (metadata_idx is not None):
+            e_md = self.md_emb(metadata_idx)  # (B, d_model)
+            e_md = e_md.unsqueeze(1)  # (B, 1, d_model) to act as token
+            x = torch.cat([e_md, x], dim=1)  # (B, L+1, d_model)
+            # update mask to cover new token
+            src_mask = torch.cat(
+                [torch.ones_like(src_mask[:, :1], dtype=src_mask.dtype), src_mask],
+                dim=1
+            )
 
         # (4) Transformer encoder
         for layer in self.layers:
@@ -455,11 +514,11 @@ class TemporalTransformerClassifier(nn.Module):
         # (5) Pool to patient-level
         pooled = self._pool(x, src_mask)                                              # (B, d_model)
 
-        # (6) Add Metadata embedding
-        if self.md_emb is not None and metadata_idx is not None:
+        # # (6) Add Metadata embedding
+        if (self.md_emb is not None) and not self.md_token and (metadata_idx is not None):
             e_md = self.md_emb(metadata_idx)                                           # (B, d_model)
             pooled = pooled + e_md                                                     # Option A: additive
-            # pooled = torch.cat([pooled, e_d], dim=-1)                                # Option B: concat
+            # pooled = torch.cat([pooled, e_d], dim=-1)                                # Option B: concat #TODO: that's the Strats option
 
         # (7) Classifier head
         out = self.classifier(pooled, return_probs=inference)                          # (B,1) logits or probs
