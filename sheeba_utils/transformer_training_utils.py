@@ -451,23 +451,26 @@ class TransformerBatch:
     cat_value_vocab: dict
     labels: torch.Tensor
 
-def load_data(NUM_YEARS: int):
+def load_data(NUM_YEARS: int, device=None):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     t_values = torch.load(
-        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__t_values__{NUM_YEARS}y.pt")
+        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__t_values__{NUM_YEARS}y.pt").to(device)
     src_mask = torch.load(
-        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__events_mask__{NUM_YEARS}y.pt")
+        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__events_mask__{NUM_YEARS}y.pt").to(device)
     event_idx = torch.load(
-        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__event_idx__{NUM_YEARS}y.pt")
+        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__event_idx__{NUM_YEARS}y.pt").to(device)
     value_idx = torch.load(
-        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__value_idx__{NUM_YEARS}y.pt")
+        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__value_idx__{NUM_YEARS}y.pt").to(device)
     numeric_value = torch.load(
-        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__numeric_value__{NUM_YEARS}y.pt")
+        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__numeric_value__{NUM_YEARS}y.pt").to(device)
     value_type_mask = torch.load(
-        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__value_type_mask__{NUM_YEARS}y.pt")
+        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__value_type_mask__{NUM_YEARS}y.pt").to(device)
     metadata_weight_idx = torch.load(
-        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__metadata_weight_idx__{NUM_YEARS}y.pt")
+        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__metadata_weight_idx__{NUM_YEARS}y.pt").to(device)
     metadata_idx = torch.load(
-        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__metadata_idx__{NUM_YEARS}y.pt")
+        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__metadata_idx__{NUM_YEARS}y.pt").to(device)
     with open(f'/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/event_type_vocab__{NUM_YEARS}y.pkl',
               'rb') as f:
         event_type_vocab = pickle.load(f)
@@ -475,7 +478,7 @@ def load_data(NUM_YEARS: int):
               'rb') as f:
         cat_value_vocab = pickle.load(f)
     labels = torch.load(
-        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__labels__{NUM_YEARS}y.pt")
+        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__labels__{NUM_YEARS}y.pt").to(device)
 
     return TransformerBatch(
         t_values=t_values,
@@ -534,7 +537,8 @@ def run_model_selection(param_grid, train_idx, transformer_batch: TransformerBat
     return results_dict, best_cfgs
 
 def main():
-    transformer_batch=load_data(NUM_YEARS=2)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    transformer_batch=load_data(NUM_YEARS=2, device=device)
     train_idx, test_idx = train_test_split(transformer_batch, NUM_YEARS=2)
     param_grid = {"capacity": [{"lr": 1e-4, "dropout": 0.3,
                                 "num_heads": 1, "d_ff": 128, "num_layers": 1, "cls_hidden": 64, "weight_decay": 1e-5},
