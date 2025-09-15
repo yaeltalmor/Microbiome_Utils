@@ -64,7 +64,7 @@ class ContinuousValueEmbedding(nn.Module):
                 nn.Tanh(),
                 nn.Linear(cve_hidden_size, d_model)
             )
-        if cve_hidden_size is 0:
+        if cve_hidden_size == 0:
             self.ffn = nn.Sequential(
             nn.Linear(1, d_model)
         )
@@ -149,10 +149,13 @@ class TimePositionalEncoding(nn.Module):
             self.omega_lin = nn.Parameter(torch.randn(1))  # linear freq
             self.phi_lin = nn.Parameter(torch.randn(1))  # linear phase
 
-    def forward(self, t_values):
+    def forward(self, t_values: torch.Tensor, src_mask: torch.Tensor):
         """
         t_values: (batch_size, seq_len) - actual months since diagnosis
+        src_mask: (B, L) boolean mask (True = valid, False = padding)
+        returns: (B, L, d_model) temporal embeddings, with padding zeroed out
         """
+        src_mask = src_mask.float()  # (B, L) 1=keep, 0=pad
         if self.emb_type == TimeEmbeddingType.REL_POS_ENC:
             # Expand t_values to shape (batch, seq_len, 1)
             position = t_values.unsqueeze(-1)  # now (batch, seq_len, 1)
@@ -173,6 +176,8 @@ class TimePositionalEncoding(nn.Module):
                 pe = torch.cat([pe, t_norm, t2_norm], dim=-1)  # (B, L, d_model+2)
                 assert pe.shape[-1] == self.temp_d_model + 2, "Temporal PE shape mismatch after adding non-periodic."
 
+            # zero out padded positions
+            pe = pe * src_mask.unsqueeze(-1)
             return pe  # shape: (batch, seq_len, d_model)
 
         elif self.emb_type == TimeEmbeddingType.TIME2VEC:
@@ -183,8 +188,11 @@ class TimePositionalEncoding(nn.Module):
             # Periodic (learnable sinusoids)
             per = torch.sin(t * self.omega + self.phi)  # (B,L,d-1)
             assert per.shape[-1] == self.temp_d_model - 1, "Time2Vec periodic shape mismatch."
+            out = torch.cat([lin, per], dim=-1)  # (B,L,d)
+            # zero out padded positions
+            out = out * src_mask.unsqueeze(-1)
 
-            return torch.cat([lin, per], dim=-1)  # (B,L,d)
+            return out
 
 
 # ------------------ METADATA EMBEDDING LAYER ------------------
@@ -428,12 +436,12 @@ class TemporalTransformerClassifier(nn.Module):
         # demographics branch (optional)
         if metadata_dim is not None:
             # TODO: if used in concat instead of sum extend classifier input dim
-            self.md_emb = MetadataEmbedding(metadata_dim, self.d_model)
+            self.md_emb = MetadataEmbedding(metadata_dim, self.d_model//2 if not md_token else self.d_model)
             self.md_token = md_token
         else:
             self.md_emb = None
 
-        self.classifier = ClassifierHead(self.d_model, hidden_dim=cls_hidden, dropout=dropout)
+        self.classifier = ClassifierHead(self.d_model if md_token else self.d_model+self.d_model//2, hidden_dim=cls_hidden, dropout=dropout)
 
     def _pool(self, x: torch.Tensor, src_mask: torch.Tensor):
         """
@@ -488,7 +496,7 @@ class TemporalTransformerClassifier(nn.Module):
         e_fv = self.hybrid_emb(event_idx, value_idx, numeric_value, value_type_mask)  # (B, L, event_d_model)
 
         # (2) Temporal encodings
-        e_t = self.time_emb(t_values)                                                  # (B, L, temp_d_model)
+        e_t = self.time_emb(t_values, src_mask= src_mask)                                                  # (B, L, temp_d_model)
 
         # (3) Concatenate
         if self.event_time_emb_agg_method == EventTimeEmbAggregateMethod.CONCAT:
@@ -516,10 +524,9 @@ class TemporalTransformerClassifier(nn.Module):
 
         # # (6) Add Metadata embedding
         if (self.md_emb is not None) and not self.md_token and (metadata_idx is not None):
-            e_md = self.md_emb(metadata_idx)                                           # (B, d_model)
-            pooled = pooled + e_md                                                     # Option A: additive
-            # pooled = torch.cat([pooled, e_d], dim=-1)                                # Option B: concat #TODO: that's the Strats option
-
+            e_md = self.md_emb(metadata_idx)                                  # (B, d_model)
+            # pooled = pooled + e_md                                          # Option A: additive
+            pooled = torch.cat([pooled, e_md], dim=-1)                # Option B: concat #TODO: that's the Strats option
         # (7) Classifier head
         out = self.classifier(pooled, return_probs=inference)                          # (B,1) logits or probs
         return out

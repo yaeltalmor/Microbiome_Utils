@@ -1,5 +1,12 @@
+import itertools
+
 import numpy as np
 import sys
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sheeba_utils.temporal_transformer import TemporalTransformerClassifier, EventEmbAggregateMethod, \
+    EventTimeEmbAggregateMethod, TimeEmbeddingType
+
 sys.path.append('/Users/yaeltalmor/PycharmProjects/labUtils')
 import torch
 import torch.nn as nn
@@ -14,9 +21,10 @@ from sklearn.metrics import (
     roc_auc_score, average_precision_score, roc_curve, precision_recall_curve
 )
 import pickle
-
+from dataclasses import dataclass
 
 #----------------------------------RUN ONE MODEL---------------------------------------------
+
 
 # --- Helper functions ---
 def create_dataloaders(train_data, val_data, batch_size=32):
@@ -141,7 +149,12 @@ def train_eval(model, train_data, val_data, max_epochs, lr, batch_size=32,
     pos_weight = compute_pos_weight(train_data[-1]).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # optimizer reduces LR when validation stops improving, giving the model a chance to refine.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3, verbose=True)
+    # If you see the curves jump early and then plateau, try halving the LR (e.g. 1e-3 → 5e-4 or 1e-4 → 5e-5).
+    # Also consider small warmup or cosine decay.
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
+
     tb_writer = SummaryWriter(log_dir=log_dir) if save_best_model else None
 
     best_ap, best_auc, best_epoch = -np.inf, -np.inf, 0
@@ -192,6 +205,7 @@ def train_eval(model, train_data, val_data, max_epochs, lr, batch_size=32,
 
     return best_auc, best_ap, best_epoch, best_fpr, best_tpr, best_prec, best_rec
 
+
 #----------------------------------RUN MODEL SELECTION---------------------------------------------
 def run_cv(model_params, idx, labels_np, config_name, save_best, run_tag,
            event_idx, value_idx, numeric_value, value_type_mask,
@@ -201,7 +215,7 @@ def run_cv(model_params, idx, labels_np, config_name, save_best, run_tag,
 
     all_aucs, all_aps, all_epochs = [], [], []
     all_fprs, all_tprs, all_precisions, all_recalls = [], [], [], []
-    metadata_dim, metadata_data = model_params["metadata_size_and_data"]
+    metadata_dim = model_params["metadata_size_and_data"][0]
 
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=0)
     for fold, (train_fold_idx, val_fold_idx) in enumerate(
@@ -258,7 +272,6 @@ def run_cv(model_params, idx, labels_np, config_name, save_best, run_tag,
     return all_aucs, all_aps, all_epochs, all_fprs, all_tprs, all_precisions, all_recalls
 
 
-
 def grid_param_check(param_grid,
                      train_idx, labels_np,
                      event_idx, value_idx, numeric_value, value_type_mask,
@@ -277,7 +290,7 @@ def grid_param_check(param_grid,
                      event_idx=event_idx, value_idx=value_idx,
                      numeric_value=numeric_value, value_type_mask=value_type_mask,
                      t_values=t_values, src_mask=src_mask,
-                     metadata_idx=metadata_idx, labels=labels,
+                     metadata_idx=params["metadata_size_and_data"][1], labels=labels,
                      event_type_vocab=event_type_vocab, cat_value_vocab=cat_value_vocab,
                      max_epochs=max_epochs, patience=patience, n_splits=n_splits)
 
@@ -300,7 +313,7 @@ def grid_param_check(param_grid,
                            event_idx=event_idx, value_idx=value_idx,
                            numeric_value=numeric_value, value_type_mask=value_type_mask,
                            t_values=t_values, src_mask=src_mask,
-                           metadata_idx=metadata_idx, labels=labels,
+                           metadata_idx=params["metadata_size_and_data"][1], labels=labels,
                            event_type_vocab=event_type_vocab, cat_value_vocab=cat_value_vocab,
                            max_epochs=max_epochs, patience=patience, n_splits=n_splits)
 
@@ -313,7 +326,6 @@ def grid_param_check(param_grid,
             all_recalls += res_b[6]
 
         # Aggregate results
-
         pos_rate = labels_np[train_idx.cpu().numpy()].mean()  # fraction of positives
 
         mean_ap, std_ap = np.mean(all_aps), np.std(all_aps)
@@ -324,8 +336,9 @@ def grid_param_check(param_grid,
 
         mean_epochs, std_epochs = np.mean(all_epochs), np.std(all_epochs)
 
+        params["metadata_size_and_data"] = params["metadata_size_and_data"][2]
         results_dict[config_name] = {
-            "params": params,
+            "params": f"{params}",
             "AP_SNR": ap_snr,
             "AP_mean": mean_ap,
             "AP_std": std_ap,
@@ -343,6 +356,14 @@ def grid_param_check(param_grid,
         out_path = os.path.join(results_dir, f"{config_name}.pkl")
         with open(out_path, "wb") as f:
             pickle.dump(results_dict[config_name], f)
+
+        # Remove after saving to avoid memory explosion
+        results_dict[config_name].pop("AUCs", None)
+        results_dict[config_name].pop("APs", None)
+        results_dict[config_name].pop("FPRs", None)
+        results_dict[config_name].pop("TPRs", None)
+        results_dict[config_name].pop("Precisions", None)
+        results_dict[config_name].pop("Recalls", None)
 
         print(f"{config_name} → "
               f"AP_SNR={ap_snr:.3f}, "
@@ -362,3 +383,173 @@ def grid_param_check(param_grid,
 
     return results_dict, best_cfgs
 
+
+def evaluate_grid_results(results_dict):
+    """
+    results_dict: dict
+        Keys = config names (from param_grid),
+        Values = dicts with {"AUC_mean": mean_auc, "AUC_std": std_auc, "AP_mean": mean_ap, "AP_std": std_ap}
+    plot: bool
+        Whether to generate boxplots of the bootstrap results.
+    """
+
+    # Collect results for plotting
+    auc_means, auc_stds, ap_means, ap_stds, configs = [], [], [], [], []
+    for name, res in results_dict.items():
+        auc_mean = res["AUC_mean"]
+        auc_std = res["AUC_std"]
+        ap_mean = res["AP_mean"]
+        ap_std = res["AP_std"]
+
+        auc_means.append(auc_mean)
+        auc_stds.append(auc_std)
+        ap_means.append(ap_mean)
+        ap_stds.append(ap_std)
+        configs.append(name)
+
+    # If asked, plot boxplots
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), sharey=False)
+
+    # AUC plot
+    sns.barplot(
+        x=auc_means, y=configs,
+        xerr=auc_stds, capsize=0.3, ax=axes[0], color="skyblue"
+    )
+    axes[0].set_title("AUC (seeds & SCV mean ± std)", fontsize=14)
+    axes[0].set_xlim(0.55, 0.85)  # tight range for your values
+    axes[0].xaxis.set_major_locator(plt.MultipleLocator(0.01))  # grid every 0.01
+    axes[0].grid(True, which="major", axis="x", linestyle="--", alpha=0.6)
+    axes[0].tick_params(axis="x", rotation=45, labelsize=10)
+
+    # AP plot
+    sns.barplot(
+        x=ap_means, y=configs,
+        xerr=ap_stds, capsize=0.3, ax=axes[1], color="lightcoral"
+    )
+    axes[1].set_title("AP (seeds & SCV mean ± std)", fontsize=14)
+    axes[1].set_xlim(0.2, 0.5)
+    axes[1].xaxis.set_major_locator(plt.MultipleLocator(0.01))
+    axes[1].grid(True, which="major", axis="x", linestyle="--", alpha=0.6)
+    axes[1].tick_params(axis="x", rotation=45, labelsize=10)
+
+    plt.tight_layout()
+    plt.show()
+
+    return
+
+@dataclass
+class TransformerBatch:
+    t_values: torch.Tensor
+    src_mask: torch.Tensor
+    event_idx: torch.Tensor
+    value_idx: torch.Tensor
+    numeric_value: torch.Tensor
+    value_type_mask: torch.Tensor
+    metadata_weight_idx: torch.Tensor
+    metadata_idx: torch.Tensor
+    event_type_vocab: dict
+    cat_value_vocab: dict
+    labels: torch.Tensor
+
+def load_data(NUM_YEARS: int):
+    t_values = torch.load(
+        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__t_values__{NUM_YEARS}y.pt")
+    src_mask = torch.load(
+        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__events_mask__{NUM_YEARS}y.pt")
+    event_idx = torch.load(
+        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__event_idx__{NUM_YEARS}y.pt")
+    value_idx = torch.load(
+        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__value_idx__{NUM_YEARS}y.pt")
+    numeric_value = torch.load(
+        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__numeric_value__{NUM_YEARS}y.pt")
+    value_type_mask = torch.load(
+        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__value_type_mask__{NUM_YEARS}y.pt")
+    metadata_weight_idx = torch.load(
+        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__metadata_weight_idx__{NUM_YEARS}y.pt")
+    metadata_idx = torch.load(
+        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__metadata_idx__{NUM_YEARS}y.pt")
+    with open(f'/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/event_type_vocab__{NUM_YEARS}y.pkl',
+              'rb') as f:
+        event_type_vocab = pickle.load(f)
+    with open(f'/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/cat_value_vocab__{NUM_YEARS}y.pkl',
+              'rb') as f:
+        cat_value_vocab = pickle.load(f)
+    labels = torch.load(
+        f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__labels__{NUM_YEARS}y.pt")
+
+    return TransformerBatch(
+        t_values=t_values,
+        src_mask=src_mask,
+        event_idx=event_idx,
+        value_idx=value_idx,
+        numeric_value=numeric_value,
+        value_type_mask=value_type_mask,
+        metadata_weight_idx=metadata_weight_idx,
+        metadata_idx=metadata_idx,
+        event_type_vocab=event_type_vocab,
+        cat_value_vocab=cat_value_vocab,
+        labels=labels
+    )
+
+
+def train_test_split(transformer_batch: TransformerBatch = None, NUM_YEARS: int = 2):
+    # === Outer split (train/test) ===
+    idx = torch.arange(transformer_batch.event_idx.size(0))
+    labels_np = transformer_batch.labels.cpu().numpy()
+    train_idx, test_idx = train_test_split(
+        idx, train_size=1600, stratify=labels_np, random_state=42
+    )
+    torch.save(train_idx,
+               f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__train_idx__{NUM_YEARS}y.pt")
+    torch.save(test_idx,
+               f"/home/elhanan/PROJECTS/SHEBA_HABERMAN_YT/temporal_transformer/data/transformer__test_idx__{NUM_YEARS}y.pt")
+
+    return train_idx, test_idx
+
+def run_model_selection(param_grid, train_idx, transformer_batch: TransformerBatch = None, NUM_YEARS: int = 2):
+
+    # Generate all combinations
+    keys, values = zip(*param_grid.items())
+    combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+    labels_np = transformer_batch.labels.cpu().numpy()
+
+    # Name each combo
+    param_grid_combination = {
+        f"combo_{i}": combo for i, combo in enumerate(combinations)
+    }
+    sub = {k: param_grid_combination[k] for k in ("combo_0", "combo_1", "combo_2", "combo_3")}
+    # Now pass the full dict to grid_param_check
+    results_dict, best_cfgs = grid_param_check(
+        sub,
+        train_idx, labels_np,
+        transformer_batch.event_idx, transformer_batch.value_idx, transformer_batch.numeric_value, transformer_batch.value_type_mask,
+        transformer_batch.t_values, transformer_batch.src_mask,
+        None,  # not used since metadata_data is unpacked later
+        transformer_batch.labels,
+        transformer_batch.event_type_vocab, transformer_batch.cat_value_vocab,
+        n_bootstraps=2, n_splits=2, max_epochs=50, patience=10,
+        results_dir="./results"
+    )
+
+    return results_dict, best_cfgs
+
+def main():
+    transformer_batch=load_data(NUM_YEARS=2)
+    train_idx, test_idx = train_test_split(transformer_batch, NUM_YEARS=2)
+    param_grid = {"capacity": [{"lr": 1e-4, "dropout": 0.3,
+                                "num_heads": 1, "d_ff": 128, "num_layers": 1, "cls_hidden": 64, "weight_decay": 1e-5},
+                               {"lr": 1e-4, "dropout": 0.3,
+                                "num_heads": 1, "d_ff": 256, "num_layers": 2, "cls_hidden": 64, "weight_decay": 1e-5}],
+                  "pooling": ["max", "mean"],
+                  "initial_emb_dim": [32, 64],
+                  "event_emb_agg_method": [EventEmbAggregateMethod.SUM],
+                  "event_time_emb_agg_method": [EventTimeEmbAggregateMethod.SUM, EventTimeEmbAggregateMethod.CONCAT],
+                  "time_emb_type": [TimeEmbeddingType.REL_POS_ENC, TimeEmbeddingType.CVE, TimeEmbeddingType.TIME2VEC],
+                  "md_token": [True, False],
+                  "metadata_size_and_data": [(5, transformer_batch.metadata_idx, "metadata_idx"),
+                                             (7, transformer_batch.metadata_weight_idx, "metadata_weight_idx")], }
+
+    results_dict, best_cfgs = run_model_selection(param_grid, train_idx, transformer_batch, NUM_YEARS=2)
+
+if __name__ == "__main__":
+    main()
