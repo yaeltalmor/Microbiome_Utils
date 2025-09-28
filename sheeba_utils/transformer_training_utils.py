@@ -4,7 +4,7 @@ import numpy as np
 import sys
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sheeba_utils.temporal_transformer import TemporalTransformerClassifier, EventEmbAggregateMethod, \
+from temporal_transformer import TemporalTransformerClassifier, EventEmbAggregateMethod, \
     EventTimeEmbAggregateMethod, TimeEmbeddingType
 
 sys.path.append('/Users/yaeltalmor/PycharmProjects/labUtils')
@@ -365,11 +365,11 @@ def grid_param_check(param_grid,
         results_dict[config_name].pop("Precisions", None)
         results_dict[config_name].pop("Recalls", None)
 
-        print(f"{config_name} → "
+        print(f"{config_name}: "
               f"AP_SNR={ap_snr:.3f}, "
-              f"AP={mean_ap:.3f} ± {std_ap:.3f}, "
-              f"AUC={mean_auc:.3f} ± {std_auc:.3f}, "
-              f"Epoch={mean_epochs:.1f} ± {std_epochs:.3f},")
+              f"AP={mean_ap:.3f} +- {std_ap:.3f}, "
+              f"AUC={mean_auc:.3f} +- {std_auc:.3f}, "
+              f"Epoch={mean_epochs:.1f} +- {std_epochs:.3f},")
 
     # Pick best by AP_SNR instead of AP_mean
     sorted_cfgs = sorted(results_dict.items(), key=lambda x: x[1]["AP_SNR"], reverse=True)
@@ -380,6 +380,14 @@ def grid_param_check(param_grid,
               f"AP={stats['AP_mean']:.3f} ± {stats['AP_std']:.3f}")
 
     best_cfgs = sorted_cfgs[:3]  # return top 3
+
+    # Save total results
+    out_path = os.path.join(results_dir, f"results_dict.pkl")
+    with open(out_path, "wb") as f:
+        pickle.dump(results_dict, f)
+    out_path = os.path.join(results_dir, f"best_cfgs.pkl")
+    with open(out_path, "wb") as f:
+        pickle.dump(best_cfgs, f)
 
     return results_dict, best_cfgs
 
@@ -495,7 +503,7 @@ def load_data(NUM_YEARS: int, device=None):
     )
 
 
-def train_test_split(transformer_batch: TransformerBatch = None, NUM_YEARS: int = 2):
+def train_test_outer_split(transformer_batch: TransformerBatch = None, NUM_YEARS: int = 2):
     # === Outer split (train/test) ===
     idx = torch.arange(transformer_batch.event_idx.size(0))
     labels_np = transformer_batch.labels.cpu().numpy()
@@ -520,17 +528,17 @@ def run_model_selection(param_grid, train_idx, transformer_batch: TransformerBat
     param_grid_combination = {
         f"combo_{i}": combo for i, combo in enumerate(combinations)
     }
-    sub = {k: param_grid_combination[k] for k in ("combo_0", "combo_1", "combo_2", "combo_3")}
+    # sub = {k: param_grid_combination[k] for k in ("combo_0", "combo_1", "combo_2", "combo_3")} FOR TOY RUN
     # Now pass the full dict to grid_param_check
     results_dict, best_cfgs = grid_param_check(
-        sub,
+        param_grid_combination,
         train_idx, labels_np,
         transformer_batch.event_idx, transformer_batch.value_idx, transformer_batch.numeric_value, transformer_batch.value_type_mask,
         transformer_batch.t_values, transformer_batch.src_mask,
         None,  # not used since metadata_data is unpacked later
         transformer_batch.labels,
         transformer_batch.event_type_vocab, transformer_batch.cat_value_vocab,
-        n_bootstraps=2, n_splits=2, max_epochs=50, patience=10,
+        n_bootstraps=50, n_splits=4, max_epochs=50, patience=10,
         results_dir="./results"
     )
 
@@ -539,7 +547,7 @@ def run_model_selection(param_grid, train_idx, transformer_batch: TransformerBat
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     transformer_batch=load_data(NUM_YEARS=2, device=device)
-    train_idx, test_idx = train_test_split(transformer_batch, NUM_YEARS=2)
+    train_idx, test_idx = train_test_outer_split(transformer_batch, NUM_YEARS=2)
     param_grid = {"capacity": [{"lr": 1e-4, "dropout": 0.3,
                                 "num_heads": 1, "d_ff": 128, "num_layers": 1, "cls_hidden": 64, "weight_decay": 1e-5},
                                {"lr": 1e-4, "dropout": 0.3,

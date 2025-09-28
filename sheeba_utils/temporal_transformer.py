@@ -149,13 +149,13 @@ class TimePositionalEncoding(nn.Module):
             self.omega_lin = nn.Parameter(torch.randn(1))  # linear freq
             self.phi_lin = nn.Parameter(torch.randn(1))  # linear phase
 
-    def forward(self, t_values: torch.Tensor, src_mask: torch.Tensor):
+    def forward(self, t_values: torch.Tensor, mask: torch.Tensor):
         """
         t_values: (batch_size, seq_len) - actual months since diagnosis
         src_mask: (B, L) boolean mask (True = valid, False = padding)
         returns: (B, L, d_model) temporal embeddings, with padding zeroed out
         """
-        src_mask = src_mask.float()  # (B, L) 1=keep, 0=pad
+        mask = mask.float()  # (B, L) 1=keep, 0=pad
         if self.emb_type == TimeEmbeddingType.REL_POS_ENC:
             # Expand t_values to shape (batch, seq_len, 1)
             position = t_values.unsqueeze(-1)  # now (batch, seq_len, 1)
@@ -177,7 +177,7 @@ class TimePositionalEncoding(nn.Module):
                 assert pe.shape[-1] == self.temp_d_model + 2, "Temporal PE shape mismatch after adding non-periodic."
 
             # zero out padded positions
-            pe = pe * src_mask.unsqueeze(-1)
+            pe = pe * mask.unsqueeze(-1)
             return pe  # shape: (batch, seq_len, d_model)
 
         elif self.emb_type == TimeEmbeddingType.TIME2VEC:
@@ -190,7 +190,7 @@ class TimePositionalEncoding(nn.Module):
             assert per.shape[-1] == self.temp_d_model - 1, "Time2Vec periodic shape mismatch."
             out = torch.cat([lin, per], dim=-1)  # (B,L,d)
             # zero out padded positions
-            out = out * src_mask.unsqueeze(-1)
+            out = out * mask.unsqueeze(-1)
 
             return out
 
@@ -496,7 +496,7 @@ class TemporalTransformerClassifier(nn.Module):
         e_fv = self.hybrid_emb(event_idx, value_idx, numeric_value, value_type_mask)  # (B, L, event_d_model)
 
         # (2) Temporal encodings
-        e_t = self.time_emb(t_values, src_mask= src_mask)                                                  # (B, L, temp_d_model)
+        e_t = self.time_emb(t_values, mask= src_mask)                                                  # (B, L, temp_d_model)
 
         # (3) Concatenate
         if self.event_time_emb_agg_method == EventTimeEmbAggregateMethod.CONCAT:
