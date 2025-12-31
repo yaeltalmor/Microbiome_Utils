@@ -8,10 +8,10 @@ from sheeba_utils.config import *
 # train_window_len - number of months for training (24, 36, 48, 60)
 # last_month_index = train_window_len - 1 (the dates are zero based)
 def masking_rule(df: pd.DataFrame, col_to_mask: str, threshold: int, intervals_from_diagnosis: bool):
-    assert 'end_of_data' in df.columns
     if intervals_from_diagnosis:
         masked_col = df[col_to_mask].where(df[col_to_mask] < threshold, np.nan)
     else:
+        assert 'end_of_data' in df.columns
         masked_col = df[col_to_mask].where(df[col_to_mask] > df.end_of_data - threshold, np.nan)
     return masked_col
 
@@ -34,7 +34,7 @@ def compute_events_aggregations(cat_based_df: pd.DataFrame) -> pd.DataFrame:
 
         # Drug Duration Variability (mean of drug durations)
         durations = [row[d] for d in DURATION_COLUMNS if pd.notna(row[d])]
-        drug_duration_mean = np.mean(durations) if len(durations) > 1 else 0
+        drug_duration_mean = np.mean(durations) if len(durations) >= 1 else np.nan
 
         # Count Procedures
         procedure_count = sum(pd.notna(row[p]) for p in PROCEDURE_COLUMNS)
@@ -74,7 +74,7 @@ def compute_events_aggregations(cat_based_df: pd.DataFrame) -> pd.DataFrame:
     return df_scores
 
 
-def calc_masked_events_agg(cat_based_df:pd.DataFrame, train_window_len:int, trajectory_length_threshold:int) -> pd.DataFrame:
+def calc_masked_events_agg(cat_based_df:pd.DataFrame, train_window_len:int, trajectory_length_threshold:int, filter_zero_intevention=True) -> pd.DataFrame:
     '''
 
     :param train_window_len: mask all patients events succeeding train_window_len
@@ -108,7 +108,8 @@ def calc_masked_events_agg(cat_based_df:pd.DataFrame, train_window_len:int, traj
     print(f"df_events_agg num patients: {df_events_agg.shape}")
     zero_interventions_ids = get_zero_intervention_patients_id(df_events_agg)
     df_events_agg = df_events_agg.set_index('patient_id')
-    df_events_agg = df_events_agg.loc[~df_events_agg.index.isin(zero_interventions_ids), :]
+    if filter_zero_intevention:
+        df_events_agg = df_events_agg.loc[~df_events_agg.index.isin(zero_interventions_ids), :]
     print(f"df_events_agg num patients: {df_events_agg.shape}")
 
 
@@ -204,14 +205,14 @@ def features_to_keep(masked_cat_based_df) -> list():
     kept_drug_cols = SMALL_MOLECULE_DRUG_COLUMNS + [
                          col for col in masked_cat_based_df.columns
                          if col.startswith('drug') and col.endswith('_duration') or col.startswith('latest_drug_')
-                     ] + ['active_drug_at_cutoff']
+                     ] # + ['active_drug_at_cutoff']
 
     # 2. Exam-related columns
     exam_prefixes = ['crp_avg_year_', 'sccai_summary_avg_year_', 'calprotectin_avg_year_']
     kept_exams_cols = [
         col for col in masked_cat_based_df.columns
         if col == 'bmi' or any(col.startswith(prefix) for prefix in exam_prefixes)
-    ]
+    ] + CRP_COLUMNS
 
     # 3. Visits and colonoscopy columns
     kept_visits_cols = [
@@ -317,12 +318,13 @@ def mask_cat_based_data(cat_based_df:pd.DataFrame, train_window_len:int, traject
     # Recalculate duration based on next drug start (if exists), otherwise based on last available month
     mask_drug_durations(train_window_len, masked_cat_based_df)
 
+    # Filter patients with zero medical intervention by dates - before filling NaNs
+    masked_cat_based_df = filter_zero_medical_intervention_patients(masked_cat_based_df)
+
     # Mask events
     for i, date_col in enumerate(date_cols):
 
         if date_col in GENERAL_DATE_EVENT_MAPPING:
-            # Filter patients with zero medical intervention - TODO: uncomment if fillna!
-            # masked_cat_based_df = filter_zero_medical_intervention_patients(masked_cat_based_df)
             # leave date column, no event column to mask.
             if date_col=='diagnosis_date':
                 # No need of these columns since it's aligned for all patients and set to 0
@@ -334,12 +336,10 @@ def mask_cat_based_data(cat_based_df:pd.DataFrame, train_window_len:int, traject
             # Mask event values columns based on corresponding date columns
             event_col = PER_PATIENT_DATE_EVENT_MAPPING[date_col][1]
             masked_cat_based_df[event_col] = masked_cat_based_df[event_col].where(masked_cat_based_df[date_col].notna(), np.nan)
-            # Filter patients with zero medical intervention - TODO: uncomment if fillna!
-            # masked_cat_based_df = filter_zero_medical_intervention_patients(masked_cat_based_df)
 
             if masked_cat_based_df[event_col].dtype == 'object':
                 # 1. Create one hot encodings to the event_col
-                event_temporal_hot = pd.get_dummies(masked_cat_based_df[event_col], prefix=event_col, dummy_na=False).astype('int')
+                event_temporal_hot = pd.get_dummies(masked_cat_based_df[event_col], prefix=event_col, dummy_na=True).astype('int')
                 # 2. take corresponding date_col, and for each patient where {event_col}__{value} is 1->
                 # replace with the patient's date_col value
                 for col in event_temporal_hot.columns:
@@ -359,13 +359,9 @@ def mask_cat_based_data(cat_based_df:pd.DataFrame, train_window_len:int, traject
     masked_cat_based_df = transform_exams_to_avg_per_year(masked_cat_based_df, train_window_len)
     # Take the latest categorical event of each value series of temporal-hot encodings
     masked_cat_based_df = create_latest_event_value_encoding(masked_cat_based_df)
-
     # Filter patients with trajectory_length >= threshold
     masked_cat_based_df = masked_cat_based_df[masked_cat_based_df["end_of_data"] + 1 >= trajectory_length_threshold]
     # masked_cat_based_df = masked_cat_based_df.set_index('patient_id')
-
-    # # Filter patients with zero medical intervention  - TODO: uncomment if not fillna! (since zero patients are discovered by counting nans)
-    masked_cat_based_df = filter_zero_medical_intervention_patients(masked_cat_based_df)
 
     return masked_cat_based_df
 
@@ -387,6 +383,9 @@ def mask_cat_based_data_for_catboost(cat_based_df:pd.DataFrame, train_window_len
 
     # Recalculate duration based on next drug start (if exists), otherwise based on last available month
     mask_drug_durations(train_window_len, masked_cat_based_df)
+
+    # Filter patients with zero medical intervention
+    masked_cat_based_df = filter_zero_medical_intervention_patients(masked_cat_based_df)
 
     # Mask events
     for i, date_col in enumerate(date_cols):
@@ -439,6 +438,9 @@ def mask_cat_based_data_for_transformer(cat_based_df: pd.DataFrame, train_window
     # Recalculate duration based on next drug start (if exists), otherwise based on last available month
     mask_drug_durations(train_window_len, masked_cat_based_df)
 
+    # Filter patients with zero medical intervention
+    masked_cat_based_df = filter_zero_medical_intervention_patients(masked_cat_based_df)
+
     # Mask events
     for i, date_col in enumerate(date_cols):
 
@@ -460,8 +462,6 @@ def mask_cat_based_data_for_transformer(cat_based_df: pd.DataFrame, train_window
     masked_cat_based_df = masked_cat_based_df[masked_cat_based_df["end_of_data"] + 1 >= trajectory_length_threshold]
     # masked_cat_based_df = masked_cat_based_df.set_index('patient_id')
 
-    # Filter patients with zero medical intervention
-    masked_cat_based_df = filter_zero_medical_intervention_patients(masked_cat_based_df)
 
     return masked_cat_based_df
 

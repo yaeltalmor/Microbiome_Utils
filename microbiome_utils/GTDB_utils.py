@@ -120,7 +120,7 @@ def plot_reads_pcnt_by_taxon_rank(feature_table_gtdb: pd.DataFrame, plot_img_pat
     return df_melt
 
 
-def filter_rows_by_taxon(feature_table_gtdb, taxon_mapping, taxon_level='g'):
+def filter_rows_by_taxon(feature_table_gtdb, taxon_mapping, taxon_level='g', taxon_column='taxon'):
     '''
 
     :param feature_table_gtdb: feature_table_gtdb.tsv output file from GTDB R script -
@@ -129,10 +129,12 @@ def filter_rows_by_taxon(feature_table_gtdb, taxon_mapping, taxon_level='g'):
     :param taxon_level: char representing taxon level
     taxa mapping: {'d': '1-Domain', 'p': '2-Phylum', 'c': '3-Class',
     'o': '4-Order', 'f': '5-Family', 'g': '6-Genus', 'u': '7-Unassigned'}
+    :param taxon_column: char representing taxon column
     :return: filtered df of rows with taxon classification in the specified resolution
     '''
     # Create a boolean mask for rows where the taxon maps to 'g'
     df = feature_table_gtdb.copy()
+    df['taxa_level'] = df[taxon_column].map(taxon_mapping)
     mask = df['taxon'].map(taxon_mapping) == taxon_level
 
     # Filter the DataFrame using the mask
